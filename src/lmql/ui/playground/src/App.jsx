@@ -585,6 +585,7 @@ function ModelSelection(props) {
       {"name": "openai/text-babbage-001", "note": "OpenAI", inprocess: false},
       {"name": "openai/text-davinci-001", "note": "OpenAI", inprocess: false},
       {"name": "openai/text-davinci-003", "note": "OpenAI", inprocess: false},
+      {"name": "openai/gpt-3.5-turbo-instruct", "note": "OpenAI", inprocess: false},
       {"name": "chatgpt", "note": "OpenAI", inprocess: false},
       {"name": "gpt-4", "note": "OpenAI", inprocess: false}
     ]
@@ -615,7 +616,7 @@ function ModelSelection(props) {
       <span className="instructions">
         <b>Custom Model</b><br/>
         Specify the model to execute your query with. You can also type in the text field above. <i>This setting will override any model specified by the query.</i>
-        {configuration.BROWSER_MODE ? <><br/><a href={"https://docs.lmql.ai/en/latest/quickstart.html"} target="_blank" rel="noreferrer" className="hidden-on-small">
+        {configuration.BROWSER_MODE ? <><br/><a href={"https://lmql.ai/docs/"} target="_blank" rel="noreferrer" className="hidden-on-small">
           Install LMQL locally </a> to use other models, e.g. from 🤗 Tranformers</>
         : null}
       </span>
@@ -989,6 +990,7 @@ const ModelResultText = styled.div`
   .system-message {
     display: none;
     text-align: center;
+    background: none !important;
   }
 
   div .tag {
@@ -2862,7 +2864,7 @@ class App extends React.Component {
             {!configuration.NEXT_MODE && <>Explore LMQL</>}
             {configuration.NEXT_MODE && <>Explore New Features</>}
           </FancyButton>}
-          {window.location.hostname.includes("lmql.ai") && <a href={"https://docs.lmql.ai/en/latest/quickstart.html"} target="_blank" rel="noreferrer" className="hidden-on-small">
+          {window.location.hostname.includes("lmql.ai") && <a href={"https://lmql.ai/docs/"} target="_blank" rel="noreferrer" className="hidden-on-small">
           Install LMQL Locally </a>}
           <Spacer />
           {/* show tooltip with build time */}
@@ -2890,7 +2892,7 @@ class App extends React.Component {
                 <a href="https://github.com/eth-sri/lmql" disabled target="_blank" rel="noreferrer"><BsGithub/>LMQL on Github</a>
               </li>
               <li>
-                <a href="https://docs.lmql.ai" disabled target="_blank" rel="noreferrer"><BsBook/>Documentation</a>
+                <a href="https://lmql.ai/docs" disabled target="_blank" rel="noreferrer"><BsBook/>Documentation</a>
               </li>
               <span>
                 LMQL {this.state.buildInfo.commit} 

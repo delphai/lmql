@@ -1,5 +1,5 @@
 from .node import *
-from .booleans import *
+from lmql.ops.max_token_hints import *
 
 class NotOp(Node):
     def forward(self, op, **kwargs):
@@ -58,3 +58,16 @@ class AndOp(Node):
             if any([a == "fin" and v == False for a,v in zip(args, operands)]):
                 return "fin"
             return "var"
+        
+    @staticmethod
+    def all(*args):
+        if len(args) == 0:
+            return None
+        elif len(args) == 1:
+            return args[0]
+        else:
+            return AndOp([AndOp.all(*args[:-1]), args[-1]])
+        
+    def token_hint(self):
+        operand_hints = [op.token_hint() for op in self.predecessors]
+        return dict_min_token_hint(operand_hints)

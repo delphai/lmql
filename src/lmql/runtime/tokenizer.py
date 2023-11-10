@@ -9,6 +9,7 @@ import pickle
 import numpy as np
 import warnings
 from typing import Optional
+from weakref import WeakValueDictionary
 
 from lmql.runtime.caching import cache_file_exists, cachefile
 
@@ -55,6 +56,15 @@ class LMQLTokenizer:
         if "FORCE_TIKTOKEN" in os.environ:
             assert type(self.tokenizer_impl) is TiktokenTokenizer
 
+    def backend(self):
+        return self.tokenizer_impl.backend()
+    
+    def __str__(self):
+        return "<LMQLTokenizer '{}' using {}>".format(self.model_identifier, self.backend())
+
+    def __repr__(self):
+        return str(self)
+
     @property
     def model_vocab_size(self):
         """
@@ -70,7 +80,7 @@ class LMQLTokenizer:
         if self._tokenizer_impl is None:
             self.loader_thread.join()
         if self._tokenizer_impl is None:
-            raise TokenizerNotAvailableError("Failed to load suitable tokenizer for model '{}'".format(self.model_identifier))
+            tokenizer_not_found_error(self.model_identifier)
         return self._tokenizer_impl
     
     @property
@@ -260,18 +270,46 @@ class LMQLTokenizer:
             offset = m.end()
         segments.append(s[offset:])
         return segments
-            
 
-def load_tokenizer(model_identifier, type="auto", **kwargs):
+runtime_tokenizers = WeakValueDictionary()
+
+def tokenizer(model_identifier, type="auto", **kwargs) -> LMQLTokenizer:
+    """
+    Loads an LMQLTokenizer for the given model identifier. 
+
+    If type is 'auto', the tokenizer will be loaded from the most suitable available backend. Otherwise, the type can be one of 'hf' (huggingface transformers), 'tiktoken' (tiktoken) or 'auto' (default).
+    """
+    global runtime_tokenizers
+    cache_identifier = model_identifier.replace("/", "-").replace(":", "__")
+
+    if cache_identifier not in runtime_tokenizers:
+        t = _load_tokenizer(model_identifier, type, **kwargs)
+        runtime_tokenizers[cache_identifier] = t
+    else:
+        t = runtime_tokenizers[cache_identifier]
+
+    return t
+
+def _load_tokenizer(model_identifier, type, **kwargs) -> LMQLTokenizer:
+    # use lmql.tokenizer(...) instead of this, to make use of instance caching
     cache_identifier = model_identifier.replace("/", "-").replace(":", "__")
     cache_path = f"tokenizer-{cache_identifier}.pkl"
 
     # check for tiktoken
-    if type in ["auto", "tiktoken"]:
+    if type in ["auto", "tiktoken"] or model_identifier.startswith("tiktoken:"):
+        if model_identifier.startswith("tiktoken:"):
+            model_identifier = model_identifier[len("tiktoken:"):]
+
+        # map gpt-3.5-turbo* to gpt-3.5-turbo
+        if "3.5" in model_identifier and "turbo" in model_identifier:
+            tiktoken_identifier = "gpt-3.5-turbo"
+        else:
+            tiktoken_identifier = model_identifier
+
         tiktoken_available = False
         # for GPT models we force non-HF tokenizers (tiktoken or python-backed)
         try:
-            if TiktokenTokenizer.is_available(model_identifier):
+            if TiktokenTokenizer.is_available(tiktoken_identifier):
                 tiktoken_available = True
         except:
             tiktoken_available = False
@@ -280,9 +318,9 @@ def load_tokenizer(model_identifier, type="auto", **kwargs):
             def loader():
                 if cache_file_exists(cache_path):
                     with cachefile(cache_path, "rb") as f:
-                        return LMQLTokenizer(model_identifier, pickle.load(f))
+                        return LMQLTokenizer(tiktoken_identifier, pickle.load(f))
                 else:
-                    t = TiktokenTokenizer(model_identifier)
+                    t = TiktokenTokenizer(tiktoken_identifier)
 
                     with cachefile(cache_path, "wb") as f:
                         pickle.dump(t, f)
@@ -290,6 +328,12 @@ def load_tokenizer(model_identifier, type="auto", **kwargs):
             
             return LMQLTokenizer(model_identifier, loader=loader)
 
+    # check for sentencepiece tokenizer
+    if "tokenizer.model" in model_identifier:
+        from lmql.runtime.tokenizers.sentencepiece_tokenizer import SentencePieceTokenizer
+        if SentencePieceTokenizer.is_available(model_identifier):
+            return LMQLTokenizer(model_identifier, tokenizer_impl=SentencePieceTokenizer(model_identifier))
+        
     # check for huggingface tokenizers
     from lmql.runtime.tokenizers.hf_tokenizer import TransformersTokenizer
     import os
@@ -312,11 +356,14 @@ def load_tokenizer(model_identifier, type="auto", **kwargs):
     # slow GPT-only tokenizer (python-backed)
     if PythonBackedTokenizer.is_available(model_identifier):
         if not "SLOW_TOKENIZER_OK" in os.environ.keys():
-            warnings.warn("warning: using slow python-backed tokenizer as no other tokenizer is available for {} (transformers or tiktoken)".format(model_identifier))
+            warnings.warn("warning: using the slow python-backed tokenizer as no other tokenizer is available for {} (transformers or tiktoken). The slow tokenizer is not recommended for production use and only supported for demo uses.".format(model_identifier), UserWarning, stacklevel=-1)
         
         return LMQLTokenizer(model_identifier, tokenizer_impl=PythonBackedTokenizer(model_identifier))
     
-    raise TokenizerNotAvailableError("Failed to locate a suitable tokenizer implementation for '{}' (if you are not using GPT models, please install the 'transformers' package)".format(model_identifier))
+    tokenizer_not_found_error(model_identifier)
+
+def tokenizer_not_found_error(model_identifier):
+    raise TokenizerNotAvailableError("Failed to locate a suitable tokenizer implementation for '{}' (Make sure your current environment provides a tokenizer backend like 'transformers', 'tiktoken' or 'llama.cpp' for this model)".format(model_identifier))
 
 def get_vocab(tokenizer):
     if hasattr(tokenizer, "vocab"):
@@ -335,7 +382,7 @@ if __name__ == "__main__":
     import torch
 
     model_identifier = sys.argv[1]
-    t = load_tokenizer(model_identifier)
+    t = tokenizer(model_identifier)
 
     to_tokenize = sys.argv[2]
 

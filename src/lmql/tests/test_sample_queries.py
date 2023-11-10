@@ -9,7 +9,6 @@ import time
 import io
 import termcolor
 
-from lmql.runtime.tokenizer import load_tokenizer
 from lmql.runtime.stats import Stats
 
 # load queries by executing ../ui/playground/src/queries.js via node and getting the object of module.exports
@@ -39,7 +38,7 @@ async def main():
     queries = load_queries()
     stderr = sys.stderr
 
-    print("\nTokenizer Backend: ", type(load_tokenizer("text-davinci-003").tokenizer_impl).__name__, "\n")
+    print("\nTokenizer Backend: ", type(lmql.tokenizer("text-davinci-003").tokenizer_impl).__name__, "\n")
     
     api_stats = Stats("openai-api")
 
@@ -74,6 +73,7 @@ async def main():
                 print(error_buffer.getvalue())
                 print(e)
                 print(termcolor.colored("[FAIL]", "red"), f"({time.time() - s:.2f}s)")
+                sys.exit(1)
 
 
 if __name__ == "__main__":

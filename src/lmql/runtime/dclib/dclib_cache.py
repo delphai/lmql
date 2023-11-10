@@ -3,8 +3,11 @@ from lmql.runtime.dclib.dclib_seq import DecoderSequence
 import numpy as np
 import pickle
 import os
+import sys
 from typing import List, Union, Any
 from dataclasses import dataclass
+import warnings
+import traceback
 
 from .dclib_array import DataArray
 from .dclib_seq import DecoderSequence, Continuation, DeterministicDecoderSequence, deepcopy, deepmerge, detseq
@@ -30,8 +33,8 @@ class CacheFile:
                     return cache.get(str(self.initial_ids), {})
         return {}
     
-    def save(self, cache):
-        if os.path.exists(self.filename):
+    def save(self, cache, overwrite=False):
+        if os.path.exists(self.filename) and not overwrite:
             with open(self.filename, "rb") as f:
                 existing_cache = pickle.load(f)
                 if existing_cache.get("model") != self.model:
@@ -43,11 +46,16 @@ class CacheFile:
             print("warning: cache file is from a different model. Its contents will be overwritten. {} != {}".format(existing_cache.get("model"), self.model))
             existing_cache = {}
         existing_cache["model"] = self.model
-        existing_cache[str(self.initial_ids)] = cache
+        existing_cache[str(self.initial_ids)] = {k: v for k,v in cache.items() if not any(asyncio.isfuture(v) for v in v)}
         
         with open(self.filename, "wb") as f:
             pickle.dump(existing_cache, f)
 
+class CacheWarning(Warning):
+    """
+    Warnings raised for cache related issues.
+    """
+    pass
 
 class CachedDcModel(DcModelRewriteMixin, CacheDelegate):
     delegate: DcModel
@@ -61,7 +69,10 @@ class CachedDcModel(DcModelRewriteMixin, CacheDelegate):
         assert delegate.cache_delegate is None, "cannot cache a model that is already cached by another cache_delegate"
         delegate.cache_delegate = mc
 
+        # keep track of incoming streams of tokens
+        # from the underlying model
         mc.token_streams = []
+        mc.token_stream_errors = []
         
         mc.cache = {}
         mc.user_data_cache = {}
@@ -89,6 +100,10 @@ class CachedDcModel(DcModelRewriteMixin, CacheDelegate):
         return mc
     
     @property
+    def model_identifier(self):
+        return self.delegate.model_identifier
+
+    @property
     def tokenizer(self):
         return self.delegate.tokenizer
 
@@ -97,8 +112,11 @@ class CachedDcModel(DcModelRewriteMixin, CacheDelegate):
             cf = CacheFile(self.cache_file, self.initial_ids, self.delegate.model_identifier)
             try:
                 cf.save(self.cache)
+            except EOFError:
+                cf.save(self.cache, overwrite=True)
             except Exception as e:
                 print("error: failed to save token cache to file", e, flush=True)
+                print([e])
                 pass
 
         self.model.cache_delegate = None
@@ -136,14 +154,18 @@ class CachedDcModel(DcModelRewriteMixin, CacheDelegate):
 
     async def get_keys(self, s: DecoderSequence, edge_type: str, **kwargs):
         kwargs = {**self.delegate.model_args, **kwargs}
+        reuse_context = kwargs.get("cache_reuse_context", set())
 
         keys = []
 
         # check for sample-id
-        if s.data("dc-edge-type"):
+        if s.data("dc-edge-type") and edge_type is not None:
+            dc_edge_type = s.data("dc-edge-type")
             # if the edge type aligns with dc-edge-type, use that instead (includes a unique sample id if available)
-            if s.data("dc-edge-type").startswith(edge_type):
-                edge_type = s.data("dc-edge-type")
+            if dc_edge_type.startswith(edge_type):
+                if not dc_edge_type in reuse_context:
+                    reuse_context.add(dc_edge_type)
+                    edge_type = dc_edge_type
 
         # compute logits mask
         mask = (await self.get_mask(s, **kwargs)).logits_mask[0]
@@ -262,7 +284,11 @@ class CachedDcModel(DcModelRewriteMixin, CacheDelegate):
             temperature = kwargs.get('temperature', 1.0)
             sampling_mode = "top-1" if temperature == 0.0 else "sample-{}".format(temperature)
 
-            cache_entries = [await self.get_cache(s, sampling_mode, user_data=True, **kwargs) for s in seqs]
+            # make sure that each uniquely sampled trajectory in the cache, cannot be used
+            # twice as a result of sampling (e.g. when sampling multiple continuations for the same sequence)
+            cache_reuse_context = set()
+            
+            cache_entries = [await self.get_cache(s, sampling_mode, user_data=True, cache_reuse_context=cache_reuse_context, **kwargs) for s in seqs]
             cached_cont = [e[1] for e in cache_entries]
             cache_keys = [e[0] for e in cache_entries]
             
@@ -393,7 +419,11 @@ class CachedDcModel(DcModelRewriteMixin, CacheDelegate):
         self.calls += 1
         sq, tokens, scores = await anext(self.delegate.score_tokens([sq], [tok], noscore=noscore))
         self.save_cached(sq.input_ids, tokens, scores, user_data)
-        
+
+    async def score_tokens(self, *args, **kwargs):
+        async for s in self.delegate.score_tokens(*args, **kwargs):
+            yield s
+
     def save_cached(self, ids: List[bytes], tokens, scores, user_data):
         # add cache entries along pre-scored trajectory
         for tok, score in zip(tokens, scores):
@@ -489,6 +519,9 @@ class CachedDcModel(DcModelRewriteMixin, CacheDelegate):
 
     def register_token_stream(self, token_iterator: callable):
         async def token_consumer(itr):
+            # keep track of the last error
+            error = None
+
             try:
                 ids = None
                 keys = None
@@ -559,10 +592,17 @@ class CachedDcModel(DcModelRewriteMixin, CacheDelegate):
                             fut.set_result(None)
                             del self.cache[k]
             except Exception as e:
-                print("DcCachedModel: token_consumer failed with:", e)
-                import traceback
-                traceback.print_exc()
-                raise e
+                error = e
+            
+            if error is not None:
+                try:
+                    msg = "CachedDcModel: underlying model {} raised an exception during generation and will thus not be cached: {} '{}'".format(self.delegate, type(error), str(error))
+                    warnings.warn(msg, category=CacheWarning)
+                except Exception as e:
+                    traceback.print_exc(file=sys.stdout)
+                    self.token_stream_errors.append(e)
+
+                sys.stdout.flush()
 
         self.token_streams = [s for s in self.token_streams if not s.done()]
 

@@ -2,7 +2,6 @@ from typing import Tuple
 import sys
 
 import numpy as np
-from llama_cpp import Llama, LlamaTokenizer
 
 import lmql.utils.nputil as nputil
 from lmql.models.lmtp.backends.lmtp_model import (LMTPModel, LMTPModelResult,
@@ -10,6 +9,8 @@ from lmql.models.lmtp.backends.lmtp_model import (LMTPModel, LMTPModelResult,
 
 class LlamaCppModel(LMTPModel):
     def __init__(self, model_identifier, **kwargs):
+        from llama_cpp import Llama
+        
         self.model_identifier = model_identifier
         self.kwargs = kwargs
 
@@ -19,6 +20,15 @@ class LlamaCppModel(LMTPModel):
         if not "verbose" in kwargs.keys():
             kwargs["verbose"] = False
         self.llm = Llama(model_path=model_identifier[len("llama.cpp:"):], logits_all=True, **kwargs)
+
+    def model_info(self):
+        import llama_cpp
+        return {
+            "model_identifier": self.model_identifier[len("llama.cpp:"):],
+            "model_type": "llama.cpp",
+            "constructor": "Llama(model_path='{}'{})".format(self.model_identifier[len("llama.cpp:"):], ", " + ", ".join(["{}={}".format(k, v) for k,v in self.kwargs.items()]) if len(self.kwargs) > 0 else ""),
+            "llama-cpp-python": llama_cpp.__version__,
+        }
 
     def eos_token_id(self):
         return 2
@@ -37,7 +47,7 @@ class LlamaCppModel(LMTPModel):
     
     def generate(self, input_ids, attention_mask, 
                  temperature: float, max_new_tokens: int, 
-                 bias_tensor, streamer: TokenStreamer) -> LMTPModelResult:
+                 bias_tensor, streamer: TokenStreamer, **kwargs) -> LMTPModelResult:
         token_scores = []
         sequence = []
 
@@ -54,8 +64,9 @@ class LlamaCppModel(LMTPModel):
         for i, token in zip(range(max_new_tokens), self.llm.generate(input_ids,
                                                             temp=temperature,
                                                             stopping_criteria=llama_streamer, 
-                                                            logits_processor=logits_processor)):
-            assert i + len(input_ids) < self.llm.n_ctx(), "The requested number of tokens exceeds the llama.cpp model's context size. Please specify a higher n_ctx value."
+                                                            logits_processor=logits_processor,
+                                                            **kwargs)):
+            assert i + len(input_ids) < self.llm.n_ctx(), f"The requested number of tokens exceeds the llama.cpp model's specified context size {self.llm.n_ctx()}. Please specify a higher n_ctx value or use a shorter prompt."
             sequence += [token]
             sq_ar = np.array(sequence)
             ts_ar = np.stack(token_scores, axis=0)

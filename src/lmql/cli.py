@@ -22,8 +22,7 @@ def cmd_chat():
         return
     file = sys.argv[2]
     absolute_path = os.path.abspath(file)
-    os.chdir(project_root)
-    os.system("python -m lmql.ui.chat " + absolute_path)
+    subprocess.run([sys.executable, "-m", "lmql.lib.chat", absolute_path], cwd=project_root)
 
 def cmd_run():
     """
@@ -36,23 +35,43 @@ def cmd_run():
 
     parser = argparse.ArgumentParser(description="Runs a LMQL program.")
     parser.add_argument("lmql_file", type=str, help="path to the LMQL file to run")
-    parser.add_argument("--no-clear", action="store_true", dest="no_clear", help="don't clear inbetween printing results")
-    parser.add_argument("--no-realtime", action="store_true", dest="no_realtime", help="don't print text as it's being generated")
+    parser.add_argument("-q", "--quiet", action="store_true", dest="quiet", help="don't print anything")
     parser.add_argument("--time", action="store_true", dest="time", help="Time the query.")
+    parser.add_argument("--certificate", type=str, default="False", help="Create a inference certificate for the executed query (True to print, path to save on disk)")
+
+    parser.add_argument("--no-clear", action="store_true", dest="no_clear", help="don't clear inbetween printing results (deprectated, use --quiet instead)")
+    parser.add_argument("--no-realtime", action="store_true", dest="no_realtime", help="don't print text as it's being generated (deprectated, use --quiet instead)")
 
     args = parser.parse_args(sys.argv[2:])
 
     absolute_path = os.path.abspath(args.lmql_file)
 
+    if args.quiet:
+        args.no_clear = True
+        args.no_realtime = True
+
     writer = lmql.printing
     writer.clear = not args.no_clear
     writer.print_output = not args.no_realtime
 
+    # parse 'certificate'
+    certificate = False
+    if args.certificate.lower() == "true":
+        certificate = True
+    elif args.certificate.lower() != "false":
+        certificate = args.certificate
+
+    kwargs = {
+        "output_writer": writer,
+        "certificate": certificate,
+        "__name__": "<lmql run '{}'>".format(args.lmql_file)
+    }
+
     if os.path.exists(absolute_path):
-        results = asyncio.run(lmql.run_file(absolute_path, output_writer=writer))
+        results = asyncio.run(lmql.run_file(absolute_path, **kwargs))
     else:
         code = args.lmql_file
-        results = asyncio.run(lmql.run(code, output_writer=writer))
+        results = asyncio.run(lmql.run(code, **kwargs))
     
     if type(results) is not list:
         results = [results]
@@ -74,11 +93,11 @@ def cmd_run():
                     print(" - {} {}".format(label, prob))
 
     if args.time:
-        print("Query took:", time.time() - start)
+        print("Query took:", time.time() - start, "seconds")
 
 def ensure_node_install():
     try:
-        v = subprocess.check_output("node --version", shell=True, stderr=subprocess.DEVNULL).decode("utf-8").strip()
+        subprocess.check_output(["node", "--version"], stderr=subprocess.DEVNULL).decode("utf-8").strip()
     except:
         print("""node.js is not installed. Please install it to use the LMQL playground.
 
@@ -105,27 +124,39 @@ def cmd_playground():
     print(f"[lmql playground {project_root}, liveserver=localhost:{args.live_port}, ui=localhost:{args.ui_port}]")
 
     # # make sure yarn is installed
-    if os.system("yarn --version") != 0:
-        os.system("npm install -g yarn")
+    if subprocess.call(["yarn", "--version"]) != 0:
+        subprocess.run(['npm', 'install', '-g', 'yarn'], check=True)
 
     # repo commit
     if os.path.exists(os.path.join(project_root, "../.git")):
-        commit = subprocess.check_output("git rev-parse HEAD", shell=True, cwd=project_root).decode("utf-8").strip()
+        commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=project_root).decode("utf-8").strip()
         commit = commit[:7]
-        has_uncomitted_files = len(subprocess.check_output("git status --porcelain", shell=True, cwd=project_root).decode("utf-8").strip()) > 0
+        has_uncomitted_files = len(subprocess.check_output(["git", "status", "--porcelain"], cwd=project_root).decode("utf-8").strip()) > 0
         if has_uncomitted_files:
             commit += ' (dirty)'
             commit = f'"{commit}"'
     else:        
         commit = version_info.commit
 
+    # Ensure that we can download dependencies before we start either live.js or the debug server
+    yarn_cwd_live = os.path.join(project_root, "lmql/ui/live")
+    subprocess.run(['yarn'], cwd=yarn_cwd_live, check=True)
+
+    yarn_cwd_playground = os.path.join(project_root, 'lmql/ui/playground')
+    subprocess.run(['yarn'], cwd=yarn_cwd_playground, check=True)
+
     # live server that executes LMQL queries and returns results and debugger data
-    live_process = subprocess.Popen("yarn && yarn cross-env PORT=" + str(args.live_port) + " node live.js", 
-        shell=True, cwd=os.path.join(project_root, "lmql/ui/live"))
+    live_process = subprocess.Popen(['yarn', 'cross-env', 'node', 'live.js'],
+        cwd=yarn_cwd_live,
+        env=dict(os.environ, PORT=str(args.live_port)),
+    )
 
     # UI that displays the debugger (uses live server API for data and remote execution)
-    ui_modern_process = subprocess.Popen(f"yarn && yarn cross-env REACT_APP_BUILD_COMMIT='{commit}' REACT_APP_SOCKET_PORT={args.live_port} yarn run start", 
-        shell=True, cwd=os.path.join(project_root, "lmql/ui/playground"))
+    ui_modern_process = subprocess.Popen(
+        ['yarn', 'cross-env', 'yarn', 'run', 'start'],
+        cwd=yarn_cwd_playground,
+        env=dict(os.environ, REACT_APP_BUILD_COMMIT=str(commit), REACT_APP_SOCKET_PORT=str(args.live_port)),
+    )
 
     try:
         live_process.wait()
@@ -191,8 +222,6 @@ def hello():
         asyncio.run(lmql.run(code_local, output_writer=lmql.printing))
     
     if backend is None or backend == "openai":
-        import lmql.runtime.dclib as dc
-        dc.clear_tokenizer()
         print("[Greeting OpenAI]")
         code_openai = 'argmax "Hello[WHO]" from "openai/text-ada-001" where len(TOKENS(WHO)) < 10 and not "\\n" in WHO'
         asyncio.run(lmql.run(code_openai, output_writer=lmql.printing, model="openai/text-ada-001"))

@@ -2,7 +2,6 @@ import asyncio
 import numpy as np
 from typing import List, Any, Union, Optional, Dict
 
-from lmql.runtime.tokenizer import load_tokenizer
 from lmql.runtime.dclib.dclib_array import DataArray, sum_scorer, alpha_length_normalized, alpha_length_normalized_det
 from lmql.runtime.dclib.dclib_seq import next_is_deterministic
 import lmql.runtime.dclib as dc
@@ -27,37 +26,7 @@ async def argmax(prompt_ids: np.ndarray, n=1, max_len=2048, **kwargs):
 
         yield (h, done)
 
-    dc.finish(done)
-
-
-@dc.decoder
-async def my_argmax(prompt_ids: np.ndarray, n=1, max_len=2048, **kwargs):
-    model = dc.model(**kwargs)
-    h = dc.seqs([dc.seq(prompt_ids)] * 1)
-    done = dc.seqs()
-    step = 0
-    
-    # provide early first result to user
-    yield h
-
-    while len(h) > 0:
-        # extend current hypothesis with top-k continuations
-        h = h.extend(await model.topk_continuations(h, k=4, **kwargs))
-        # check logprob of each continuation
-        for s in h.items():
-            print(s.logprobs[-1], flush=True)
-        # select top-1 continuation only
-        h = dc.topk(h, 1)
-        
-        print(h, flush=True)
-        h = await model.rewrite(h, noscore=True)
-        h, done = (h + done).separate_by(dc.logical_not(dc.eos), dc.lt(max_len))
-        
-        step += 1
-
-        yield (h, done)
-
-    dc.finish(done)
+    dc.finish(done, singular=n == 1)
 
 @dc.decoder
 async def sample(prompt_ids: np.ndarray, temperature=1, n=1, max_len=2048, **kwargs):
@@ -74,7 +43,7 @@ async def sample(prompt_ids: np.ndarray, temperature=1, n=1, max_len=2048, **kwa
     
     yield (h, done)
 
-    dc.finish(done)
+    dc.finish(done, singular=True)
 
 
 @dc.decoder
@@ -155,6 +124,7 @@ async def beam_sample(prompt_ids: np.ndarray, n=4, max_len=None, temperature=Non
 
         h = dc.repeat(h, n*len(h))
         h = h.extend(await model.sample(h, num_samples=1, temperature=temperature))
+        h = dc.token_unique(h)
         
         h = await model.rewrite(h)
         h, done = (h + done).separate_by(not_done)
@@ -209,13 +179,13 @@ async def beam_search(prompt_ids: np.ndarray, n=4, max_len=None, **kwargs):
 dc.decoder(beam_search, "beam")
 
 @dc.decoder
-async def beam_var(prompt_ids: np.ndarray, n=4, max_len=None, inject_stop=False, prune=None, return_first=False, **kwargs):
+async def beam_var(prompt_ids: np.ndarray, n=4, max_len=None, inject_stop=False, prune=None, return_first=False, alpha=0.7, **kwargs):
     s = Stats("beam_var")
 
     n = kwargs.get("num_beams", n)
     max_len = max_len or 2048
     model = dc.model(**kwargs)
-    alpha = kwargs.get("alpha", 0.7)
+    alpha = kwargs.get("alpha", alpha)
     scorer = alpha_length_normalized_det(alpha=alpha)
 
     # keep track of active beams and finished sequences
@@ -454,6 +424,9 @@ async def topk_var_continuations(model, seqs: dc.DataArray, active_variable, b, 
 
     def is_active_variable(s):
         v = s.data("head.variable")
+        ctr = s.data("head.recurring_variable_counter")
+        v = v + "_" + str(ctr.get(v, 0))
+        
         if v is None: return False
         if active_variable.get() is None: 
             active_variable.set(v)
@@ -488,8 +461,9 @@ async def topk_var_continuations(model, seqs: dc.DataArray, active_variable, b, 
 
         while not (len(active) == 0 or (len(top_variable_done) == b and dc.max_score(active, scorer=nw_score) < dc.min_score(top_variable_done, scorer=nw_score))):
             # inner variable decoding (beam_sample with 2*n beams and branching factor n)
-            if sample:
-                active = active.extend(await model.sample(active, temperature=temperature, num_samples=b))
+            if method == "sample":
+                active = dc.repeat(active, b*len(active))
+                active = active.extend(await model.sample(active, temperature=temperature, num_samples=1))
             else:
                 kwargs.pop("temperature", None)
                 active = active.extend(await model.topk_continuations(active, k=b, **kwargs))
@@ -498,7 +472,13 @@ async def topk_var_continuations(model, seqs: dc.DataArray, active_variable, b, 
                 # s.data("eos_score", s.score
                 s.data("eos_score", regular_scorer(s.logprobs))
 
+            eos_scores_before = active.data("eos_score").flatten().items()
+
             active = await model.rewrite(active)
+
+            # make sure eos_scores survive rewrite
+            for s, eos_score in zip(active.flatten().items(), eos_scores_before):
+                s.data("eos_score", eos_score)
 
             active, variable_done = (active + variable_done).separate_by(is_active_variable)
             active = dc.topk(active, b)
@@ -510,7 +490,7 @@ async def topk_var_continuations(model, seqs: dc.DataArray, active_variable, b, 
             
             yield active
     elif method == "sample":
-        active = active.element_wise(lambda s: s.copy() * b)
+        active = dc.repeat(active, b*len(active))
         i = 0
 
         while not is_seq_beams_search_done(active, variable_done, num_beams=b):

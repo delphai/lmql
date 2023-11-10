@@ -8,7 +8,9 @@ from lmql.ops.node import *
 
 from lmql.ops.inline_call import InlineCallOp
 from lmql.ops.booleans import *
+from lmql.ops.max_token_hints import *
 from lmql.ops.regex import Regex
+from lmql.models.model_info import model_info
 
 lmql_operation_registry = {}
 
@@ -78,6 +80,11 @@ def DynamicTypeDispatch(name, type_map):
                 return None
             return self.get_handler(kwargs.get("operands")).final(*args, **kwargs)
         
+        def token_hint(self):
+            if self.delegate is not None:
+                return self.delegate.token_hint()
+            return super().token_hint()
+
         def __str__(self):
             if self.delegate is not None:
                 return str(self.delegate)
@@ -193,7 +200,7 @@ class IntOp(Node):
                 ("*", False)
             )
 
-        if "turbo" in context.runtime.model_identifier or "gpt-4" in context.runtime.model_identifier:
+        if model_info(context.runtime.model_identifier).is_chat_model:
             if not all([c in "0123456789" for c in v]):
                 return fmap(
                     ("*", False)
@@ -252,23 +259,27 @@ class TokensOp(Node):
     def forward(self, x, context, **kwargs):
         if x is None: return None
         if x == "": return []
-
-        return tuple(context.runtime.model.sync_tokenize(x))
+        
+        var_op: Var = self.predecessors[0]
+        assert type(var_op) is Var, "The first argument of TOKENS must be a direct reference to a template variable."
+        tokens = context.get_tokens(var_op.name)
+        return tuple(tokens)
 
     def follow(self, v, context=None, **kwargs):
         if v is None: return None
         contains_next_token = v != strip_next_token(v)
 
-        if not contains_next_token:
-            tokens = tuple(context.runtime.model.sync_tokenize(v))
-            return tokens
-        v = strip_next_token(v)
-        tokens = tuple(context.runtime.model.sync_tokenize(v))
+        var_op: Var = self.predecessors[0]
+        assert type(var_op) is Var, "The first argument of TOKENS must be a direct reference to a template variable."
+        tokens = context.get_tokens(var_op.name)
 
-        return fmap(
-            ("eos", tokens),
-            ("*", (*tokens, NextToken))
-        )
+        if not contains_next_token:
+            return tokens
+        else:
+            return fmap(
+                ("eos", tokens),
+                ("*", (*tokens, NextToken))
+            )
 
     def final(self, x, context, operands=None, result=None, **kwargs):
         return x[0]
@@ -368,6 +379,33 @@ class Lt(Node):
             r = transition_table[op1][op2]
         
         return r
+    
+    def token_hint(self):
+        """
+        Checks if this Lt operation, imposes an upper limit on the
+        number of tokens that can be generated.
+        """
+        num = [n for n in self.predecessors if type(n) is int]
+        len_op = [n for n in self.predecessors if isinstance(n, LenOp)]
+        if len(num) != 1 or len(len_op) != 1:
+            return super().token_hint()
+
+        limit = num[0]
+
+        # if limit is not rhs, it is a lower bound, not a limit
+        if limit != self.predecessors[1]:
+            return super().token_hint()
+
+        tokens_op = [n for n in len_op[0].predecessors if isinstance(n, TokensOp)]
+        if len(tokens_op) != 1:
+            return super().token_hint()
+        
+        var = [n for n in tokens_op[0].predecessors if isinstance(n, Var)]
+
+        if len(var) != 1:
+            return super().token_hint()
+        
+        return {var[0].name: limit - 1}
 
 def Gt(preds): return Lt(list(reversed(preds)))
 
@@ -483,6 +521,29 @@ class EqOpInt(Node):
             return "fin"
         
         return "var"
+    
+    def token_hint(self):
+        """
+        Checks if this Eq operation imposes an exact limit on the
+        number of tokens that can be generated.
+        """
+        num = [n for n in self.predecessors if type(n) is int]
+        len_op = [n for n in self.predecessors if isinstance(n, LenOp)]
+        if len(num) != 1 or len(len_op) != 1:
+            return super().token_hint()
+
+        limit = num[0]
+
+        tokens_op = [n for n in len_op[0].predecessors if isinstance(n, TokensOp)]
+        if len(tokens_op) != 1:
+            return super().token_hint()
+        
+        var = [n for n in tokens_op[0].predecessors if isinstance(n, Var)]
+
+        if len(var) != 1:
+            return super().token_hint()
+        
+        return {var[0].name: limit}
 
 EqOp = DynamicTypeDispatch("EqOp", (
     ((int, int), EqOpInt),
@@ -670,6 +731,7 @@ def remainder(seq: str, phrase: str):
 
 @LMQLOp("REGEX")
 class RegexOp(Node):
+
     def forward(self, *args, **kwargs):
         if any([a is None for a in args]): return None
         x = args[0]
@@ -685,23 +747,23 @@ class RegexOp(Node):
         
         if x == strip_next_token(x):
             return fmap(
-                ("*", Regex(ex).fullmatch(x))
+                ("*", Regex(ex).fullmatch(strip_next_token(x)))
             )
 
         r = Regex(ex)
-        rd = r.d(strip_next_token(x)) # take derivative
+        rd = r.d(strip_next_token(x), verbose=False) # take derivative
         print(f"r={r.pattern} x={strip_next_token(x)} --> {rd.pattern if rd is not None else '[no drivative]'}")
         if rd is None:
             return False 
         elif rd.is_empty(): # derivative is empty -> full match; therefore we must end
             return fmap(
-                ("eos", True)
+                ("eos", None)
             )
         else: # only permit tokens form the regex derivative
-            return fmap(
-                (tset(rd.pattern, regex=True, prefix=True), True),
-                #('*', False)
+            f = fmap(
+                (tset(rd.pattern, regex=True, prefix=True), True), # includes EOS if the regex is fulfilled greedily
             )
+            return f
 
     def final(self, ops_final, result=None, operands=None, **kwargs):
         if ops_final[0] == "fin": return "fin"
@@ -962,6 +1024,8 @@ class EraseOp(Node):
         if isinstance(other, StopAtOp):
             return "after"
         return 0
+    
+# executes an arbitrary Python lambda expr on the operands (no support for advanced follow semantics)
 class OpaqueLambdaOp(Node):
     def forward(self, *args, **kwargs):
         if any([a is None for a in args]): return None
@@ -975,6 +1039,32 @@ class OpaqueLambdaOp(Node):
         return fmap(
             ("*", fct(*args))
         )
+    
+# forces a pre-determined value in the prompt as well as in value semantics
+# in the postprocessing stage (used internally)
+class FixedValueOp(Node):
+    def __init__(self, predecessors, variable_value, prompt_value):
+        super().__init__(predecessors)
+        self.variable_value = variable_value
+        self.prompt_value = prompt_value
+    
+    def forward(self, value, *args, **kwargs):
+        return InOpStrInSet([]).forward(value, [self.prompt_value])
+    
+    def follow(self, value, *args, **kwargs):
+        return InOpStrInSet([]).follow(value, [self.prompt_value])
+
+    def final(self, args, result=None, **kwargs):
+        return InOpStrInSet([]).final(args, result=result, **kwargs)
+
+    def postprocess_var(self, var_name):
+        return True
+    
+    def postprocess_order(self, other, **kwargs):
+        return "after"
+    
+    def postprocess(self, operands, value):
+        return self.variable_value
 
 def execute_op_stops_at_only(variable: str, op: Node, trace, result=None, sidecondition=None):
     """

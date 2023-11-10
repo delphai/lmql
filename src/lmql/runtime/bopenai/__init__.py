@@ -1,4 +1,4 @@
-from .batched_openai import AsyncOpenAIAPI, async_buffer, response_buffer
+from .batched_openai import AsyncOpenAIAPI, async_buffer, response_buffer, OpenAIAPIWarning
 import openai as openai
 
 # redirects to openai.*
@@ -92,6 +92,6 @@ class Completion:
     @staticmethod
     async def create(*args, **kwargs):
         global _api
-        if _api is None:
+        if _api is None or not _api.is_available():
             _api = AsyncOpenAIAPI()
         return await _api.complete(*args, **kwargs)

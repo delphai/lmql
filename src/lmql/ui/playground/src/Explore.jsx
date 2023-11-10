@@ -218,7 +218,6 @@ const Tile = styled.div.attrs({
   margin-left: 0pt;
   margin-top: 0pt;
   cursor: pointer;
-  transition: 0.05s ease-in-out transform;
   height: 80pt;
   width: 100pt;
   border: 1pt solid #d4d4d4;
@@ -229,6 +228,8 @@ const Tile = styled.div.attrs({
   
   align-items: flex-start;
   justify-content: flex-start;
+
+  transition: 0.1s linear transform;
 
   :hover {
     transform: scale(1.05);
@@ -415,10 +416,10 @@ export function Explore() {
         fetch(q.state).then((r) => r.text()).then((r) => {
           persistedState.load(r);
           persistedState.setItem("lmql-editor-contents", q.code)
-          window.setTimeout(() => trackingState.setTrackMostLikely(true), 10);            
+          window.setTimeout(() => trackingState.setTrackMostLikely(true), 10);
         }).catch((e) => {
           console.error(e)
-          alert("Error loading example.")
+          alert("Error loading the selected example. See the console for more details.")
         });
       } else {
         persistedState.setItem("lmql-editor-contents", q.code)
@@ -488,7 +489,7 @@ export function Explore() {
     let description = <>
     LMQL is a query language for large language models. Explore the examples below to get started.
     <LinkBox>
-      <a className="button" target="_blank" rel="noreferrer" href="https://docs.lmql.ai">Documentation</a>
+      <a className="button" target="_blank" rel="noreferrer" href="https://lmql.ai/docs">Documentation</a>
       <a className="button" target="_blank" rel="noreferrer" href="https://lmql.ai">Overview</a>
     </LinkBox>
     </>

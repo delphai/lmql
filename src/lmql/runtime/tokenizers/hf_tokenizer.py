@@ -6,7 +6,6 @@ def unicode(v):
 class TransformersTokenizer:
     def __init__(self, model_identifier, tokenizer):
         from transformers import AutoTokenizer
-        
         self.model_identifier = model_identifier
         self.tokenizer = tokenizer
 
@@ -51,7 +50,8 @@ class TransformersTokenizer:
         Translates a string into a list of tokens (sub-strings)
         """
         if asbytes:
-            return self.decode_tokens_bytes(self.tokenizer(text, add_special_tokens=add_special_tokens)["input_ids"])
+            ids = self(text, add_special_tokens=add_special_tokens)["input_ids"] 
+            return self.decode_tokens_bytes(ids)
         return self.tokenizer.tokenize(text, add_special_tokens=add_special_tokens)
 
     def decode_tokens_bytes(self, ids):
@@ -106,6 +106,9 @@ class TransformersTokenizer:
     def name(self):
         return "hf-" + self.model_identifier
     
+    def backend(self):
+        return "transformers " + type(self.tokenizer).__name__
+    
 class LlamaTransformersTokenizer(TransformersTokenizer):
     """Aligns the behavior of HF LlamaTokenizer with that of gpt tokenizers."""
 
@@ -126,7 +129,11 @@ class LlamaTransformersTokenizer(TransformersTokenizer):
         return super().tokenize(text, asbytes, add_special_tokens)
 
     def __call__(self, text, add_special_tokens=False):
-        for dummy_token in ["@", "^", ""]:
+        prepend_dummy_tokens = ["@", "^", ""]
+        # make sure that llama-specific INST tokens are tokenized as-is
+        if text.startswith("[INST]"): prepend_dummy_tokens = [""]
+
+        for dummy_token in prepend_dummy_tokens:
             text_to_tokenize = dummy_token + text
             
             text_to_tokenize = self.tokenizer.bos_token + text_to_tokenize

@@ -81,7 +81,7 @@ def extract_json(s):
 @lmql.query
 async def single_shot_as_type(s, ty, model="chatgpt"):
     '''lmql
-    argmax(openai_chunksize=1024)
+    argmax(chunksize=1024)
         schema_description = type_schema_description(ty)
         "Provided a data schema of the following schema: {schema_description}\n"
         "Translate the following into a JSON payload: {s}\n"
@@ -138,6 +138,7 @@ async def is_type(ty, description=False):
             
             if key_type is str:
                 if type(existing_value) is str:
+                    existing_value = existing_value.replace("\\n", "\\\n").replace("\"", "\\\"")
                     "\"{existing_value}\"{line_end}"
                 else:
                     '"[STRING_VALUE]"{line_end}' where STOPS_BEFORE(STRING_VALUE, '"') and \
@@ -147,7 +148,7 @@ async def is_type(ty, description=False):
                     "{existing_value}{line_end}"
                 else:
                     # Chat API models do not support advanced integer constraints
-                    if "turbo" in context.interpreter.model_identifier or "gpt-4" in context.interpreter.model_identifier:
+                    if context.interpreter.model_identifier.endswith("-turbo") or "gpt-4" in context.interpreter.model_identifier:
                         "[INT_VALUE]" where STOPS_AT(INT_VALUE, ",") and len(TOKENS(INT_VALUE)) < 4
                         if line_end.startswith(",") and not INT_VALUE.endswith(","):
                             ","
@@ -190,6 +191,6 @@ async def is_type(ty, description=False):
     try:
         json_payload = json.loads(payload)
     except Exception as e:
-        print("Failed to parse JSON from", payload)
+        raise ValueError("Failed to parse JSON from" + str([payload]))
     return type_dict_to_type_instance(json_payload, ty)
     '''

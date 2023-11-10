@@ -1,21 +1,39 @@
 {
     "scopeName": "lmql.qstring.injection",
-    "injectionSelector": "L:comment.inline-lmql #string, L:source.lmql #string",
+    "injectionSelector": "L:source.lmql string, source.python comment.inline-lmql",
     "patterns": [
         {
             "begin": "\\[",
             "end": "\\]",
-            "name": "constant.other"
+            "name": "keyword.control.lmql",
+            "patterns": [
+                {
+                    "include": "source.python#expression"
+                },
+                {
+                    "match": "\\b([a-zA-Z_][a-zA-Z0-9_]*)\\b(?=\\])",
+                    "name": "entity.name.function.lmql"
+                }
+            ]
         },
         {
             "begin": "\\{",
             "end": "\\}",
-            "contentName": "constant.other",
+            "name": "keyword.control.lmql",
             "patterns": [
                 {
                     "include": "source.python#f-expression"
+                },
+                {
+                    "match": "\\{",
+                    "name": "punctuation.section.block.begin.lmql"
+                },
+                {
+                    "match": "\\}",
+                    "name": "punctuation.section.block.end.lmql"
                 }
             ]
         }
     ]
 }
+

@@ -1,3 +1,11 @@
+def parse_num(prediction):
+    import re
+    
+    # remove all non [0-9] and non [.,] characters
+    prediction = re.sub(r"[^0-9.,]", "", prediction)
+    # remove anything beyond second .
+    prediction = ".".join(prediction.split(".")[:2])
+    return float(prediction.replace(",", ""))
 
 try:
     from datasets import load_dataset
@@ -5,6 +13,7 @@ try:
 except:
     raise Exception("Please install the 'datasets' library to use LMQL's dataset loading functionality. You can do this by running 'pip install datasets'.")
 
+import subprocess
 from dataclasses import dataclass
 
 global dataset_cache
@@ -36,7 +45,7 @@ def gsm8k(n: int, split="test"):
 
     question = s["question"]
     answer = s["answer"]
-    result = int(answer.split("####", 1)[1].strip())
+    result = int(answer.split("####", 1)[1].strip().replace(",", ""))
 
     return GMS8KSample(question, answer, result)
 
@@ -90,7 +99,6 @@ def trackingshuffledobjects(n: int, variant="five_objects"):
     # first make sure ~/.cache/lmql/datasets/shuffled_objects.json exists otherwise load from https://raw.githubusercontent.com/google/BIG-bench/main/bigbench/benchmark_tasks/tracking_shuffled_objects/three_objects/task.json
     import os
     import json
-    import requests
 
     path = os.path.join(os.path.expanduser("~"), ".cache", "lmql", "datasets", "shuffled_objects" + variant + ".json")
 
@@ -98,7 +106,7 @@ def trackingshuffledobjects(n: int, variant="five_objects"):
         os.makedirs(os.path.join(os.path.expanduser("~"), ".cache", "lmql", "datasets"), exist_ok=True)
 
         url = f"https://raw.githubusercontent.com/google/BIG-bench/main/bigbench/benchmark_tasks/tracking_shuffled_objects/{variant}/task.json"
-        os.system(f"curl {url} > {path}")
+        subprocess.run(['curl', url], stdout=open(path, 'w'), check=True)
         assert os.path.exists(path)
 
     with open(path, "r") as f:
@@ -116,15 +124,14 @@ def trackingshuffledobjects(n: int, variant="five_objects"):
 def fever(n: int):
     import os
     import json
-    import requests
 
     path = os.path.join(os.path.expanduser("~"), ".cache", "lmql", "datasets", "fever.json")
 
     if not os.path.exists(path):
         os.makedirs(os.path.join(os.path.expanduser("~"), ".cache", "lmql", "datasets"), exist_ok=True)
 
-        url = f"https://raw.githubusercontent.com/google/BIG-bench/main/bigbench/benchmark_tasks/fact_checker/fever/task.json"
-        os.system(f"curl {url} > {path}")
+        url = "https://raw.githubusercontent.com/google/BIG-bench/main/bigbench/benchmark_tasks/fact_checker/fever/task.json"
+        subprocess.run(['curl', url], stdout=open(path, 'w'), check=True)
         assert os.path.exists(path)
 
     with open(path, "r") as f:
@@ -142,15 +149,14 @@ def fever(n: int):
 def wikidata(n: int):
     import os
     import json
-    import requests
 
     path = os.path.join(os.path.expanduser("~"), ".cache", "lmql", "datasets", "wikidata.json")
 
     if not os.path.exists(path):
         os.makedirs(os.path.join(os.path.expanduser("~"), ".cache", "lmql", "datasets"), exist_ok=True)
 
-        url = f"https://raw.githubusercontent.com/google/BIG-bench/main/bigbench/benchmark_tasks/qa_wikidata/task.json"
-        os.system(f"curl {url} > {path}")
+        url = "https://raw.githubusercontent.com/google/BIG-bench/main/bigbench/benchmark_tasks/qa_wikidata/task.json"
+        subprocess.run(['curl', url], stdout=open(path, 'w'), check=True)
         assert os.path.exists(path)
 
     with open(path, "r") as f:

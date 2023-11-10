@@ -1,16 +1,12 @@
 import openai
-import traceback
 import asyncio
-import sys
 from dataclasses import dataclass
 import random
 import warnings
-import pickle
-import os
-import time
 from functools import total_ordering
 
-from .openai_api import complete, OpenAIRateLimitError, Capacity
+from lmql.models.model_info import model_info
+from .openai_api import complete, OpenAIRateLimitError, Capacity, is_chat_model, OpenAIAPILimitationError
 
 global logit_bias_logging
 logit_bias_logging = True
@@ -23,7 +19,9 @@ class EmptyStreamError(Exception): pass
 class ChaosException(openai.APIError): pass
 class APIShutDownException(RuntimeError): pass
 
-class OpenAILogitBiasLimitationWarning(Warning): pass
+class OpenAIAPIWarning(Warning): pass
+class OpenAILogitBiasLimitationWarning(OpenAIAPIWarning): pass
+
 class MaximumRetriesExceeded(Exception): 
     def __init__(self, error: Exception, retries: int):
         self.error = error
@@ -85,7 +83,8 @@ class Batcher:
             buckets.setdefault(identifier, []).append(t)
         
         for bucket in buckets.values():
-            if "turbo" in bucket[0]["model"]:
+            kwargs = bucket[0]
+            if is_chat_model(kwargs):
                 for t in bucket:
                     self.queued_requests.append(make_request_args([t]))
                 continue
@@ -156,7 +155,12 @@ class Stats:
         else:
             print("warning: cost_estimate(): unknown model {}".format(model))
             return -1
-
+        
+def trace_metric(request_kwargs, *args, method='add', **kwargs):
+    if "tracer" not in request_kwargs.keys():
+        return
+    # log metrics to tracer via the specified method
+    getattr(request_kwargs["tracer"], method)(*args, **kwargs)
 class ResponseStream:    
     def __init__(self, scheduler, kwargs, response, n, request_ids, maximum_retries=20, chaos = None, stats: Stats=None):
         self.scheduler: AsyncOpenAIAPI = scheduler
@@ -169,6 +173,9 @@ class ResponseStream:
 
         self.stats.requests += 1
         self.stats.sum_batch_size += n
+        
+        trace_metric(kwargs, "openai.requests", 1)
+        trace_metric(kwargs, "openai.batch_size", n)
 
         # task that always waits for new data in the response stream
         self.iteration_task = asyncio.create_task(self.iter_task())
@@ -187,7 +194,7 @@ class ResponseStream:
             self.response = aiter(self.response)
             async for data in self.response:
                 if self.chaos is not None and random.random() > (1.0 - self.chaos):
-                    raise ChaosException()
+                    raise ChaosException("OpenAI API: ChaosException probabilistically triggered by chaos value {}".format(self.chaos))
                 
                 if not "choices" in data.keys():
                     print("No choices in data", data)
@@ -197,6 +204,7 @@ class ResponseStream:
                     index = c["index"]
 
                     self.stats.tokens += len(c["logprobs"]["tokens"])
+                    trace_metric(self.kwargs, "openai.tokens", len(c["logprobs"]["tokens"]))
                     assert c is not None
                     self.slices[index].digest(c)
                     self.slices[index].finish_reason = c["finish_reason"]
@@ -205,7 +213,6 @@ class ResponseStream:
             for c in self.slices:
                 c.finish()
         except Exception as e:
-            print("Failed with", e)
             for c in self.slices:
                 c.error(e)
 
@@ -497,7 +504,8 @@ class ResponseStreamSliceIterator:
                 # if the stream of our self.slice errors out, we can recover by creating a new 
                 # stream via a new call to openai.Completion.create
                 attempt: RecoveryAttempt = data
-                warnings.warn(f"OpenAI API: Underlying stream of OpenAI complete() call failed with error {type(attempt.error)} {attempt.error} Retrying... (attempt: {self.retries})")
+                warnings.warn(f"OpenAI API: Underlying stream of OpenAI complete() call failed with error\n\n{attempt.error} ({type(attempt.error)})\n\nRetrying... (attempt: {self.retries})", 
+                              category=OpenAIAPIWarning, source=attempt.error)
                 self.retries += 1
                 # if we have exceeded the maximum number of retries, raise the error
                 if self.retries > attempt.maximum_retries:
@@ -569,6 +577,8 @@ class AsyncOpenAIAPI:
         
         self.complete_request_queue = asyncio.Queue()
         self.complete_request_workers = [asyncio.create_task(self.complete_request_worker(self.complete_request_queue)) for i in range(5)]
+        
+        self.worker_loops = set()
 
         self.stats_logger = None 
         
@@ -581,39 +591,18 @@ class AsyncOpenAIAPI:
 
         self.stats = Stats()
         self.nostream = False
-        
-        # INTERNAL OPTION only. In theory we can do caching but there are consequences
-        # deterministic sampling, large cache size, cache loading startup time, etc.
-        # also, when exposed to clients, this should be implemented on a per query level, not per batches
-        self.use_cache = False
-
+    
         self.tokenizer = None
-        
-        self.cache = {}
-        self.cache_dir = "."
         self.futures = set()
-        self.restore_cache()
 
         self.first_token_latency = 0
 
     def reset_latency_stats(self):
         self.first_token_latency = 0
 
-    def restore_cache(self):
-        if not self.use_cache:
-            return
-        cache_file = "openai.completions.cache"
-        if os.path.exists(os.path.join(self.cache_dir, cache_file)):
-            with open(os.path.join(self.cache_dir, cache_file), "rb") as f:
-                self.cache = pickle.load(f)
-    
-    def save_cache(self):
-        cache_file = "openai.completions.cache"
-        with open(os.path.join(self.cache_dir, cache_file), "wb") as f:
-            pickle.dump(self.cache, f)
-
     def start_stats_logger(self):
         self.stats_logger = asyncio.create_task(self.stats_logger_worker())
+    
     def stop_stats_logger(self):
         self.stats_logger.cancel()
 
@@ -633,18 +622,19 @@ class AsyncOpenAIAPI:
         self.warn_chaos()
 
     def __del__(self):
-        if self.stats_logger is not None:
+        if hasattr(self, "stats_logger") and self.stats_logger is not None:
             self.stats_logger.cancel()
-        # cancel the score worker task
-        self.complete_api_worker.cancel()
-        for worker in self.complete_request_workers:
-            worker.cancel()
-        try:
-            loop = asyncio.get_event_loop()
-            while not all([t.done() for t in (self.complete_request_workers + [self.complete_api_worker])]):
-                loop._run_once()
-        except:
-            pass # if no more event loop is around, no need to wait for the workers to finish
+        
+            # cancel the score worker task
+            self.complete_api_worker.cancel()
+            for worker in self.complete_request_workers:
+                worker.cancel()
+            try:
+                loop = asyncio.get_event_loop()
+                while not all([t.done() for t in (self.complete_request_workers + [self.complete_api_worker])]):
+                    loop._run_once()
+            except:
+                pass # if no more event loop is around, no need to wait for the workers to finish
 
     async def api_complete_worker(self, queue):
         while True:
@@ -675,6 +665,8 @@ class AsyncOpenAIAPI:
         return False
 
     async def complete_request_worker(self, queue: asyncio.Queue):
+        self.worker_loops.add(asyncio.get_running_loop())
+        
         while True:
             try:
                 kwargs = await queue.get()
@@ -684,7 +676,7 @@ class AsyncOpenAIAPI:
                 while True:
                     try:
                         if retries != self.maximum_retries:
-                            warnings.warn("Retrying {} more times".format(retries))
+                            warnings.warn("Retrying {} more times".format(retries), category=OpenAIAPIWarning)
                             await asyncio.sleep(0.5)
                         task = asyncio.create_task(self._create(**kwargs))
                         res = await asyncio.wait_for(task, timeout=5.5)
@@ -692,11 +684,17 @@ class AsyncOpenAIAPI:
                     except Exception as e:
                         if type(e) is AssertionError:
                             raise e
+                        if type(e) is OpenAIAPILimitationError:
+                            raise e
                         self.stats.errors += 1
                         retries -= 1            
-                        warnings.warn("OpenAI: " + str(e) + ' "' + str(type(e)) + '"')
+                        warnings.warn("OpenAI: " + str(e) + ' "' + str(type(e)) + '"', category=OpenAIAPIWarning)
                         # do not retry if the error is definitive (API configuration error)
                         if "api.env" in str(e): raise e
+                        # handle definitive errors
+                        if "Incorrect API key provided" in str(e): raise e
+                        if "No such organization" in str(e): raise e
+
                         if kwargs.get("api_config", {}).get("errors", None) == "raise":
                             raise e
                         await asyncio.sleep(0.5)
@@ -704,7 +702,7 @@ class AsyncOpenAIAPI:
                             raise e
                         if type(e) is TimeoutError or type(e) is OpenAIRateLimitError:
                             t = (2.0 * random.random()) ** (self.maximum_retries - retries)
-                            warnings.warn("Backing off for {} seconds".format(t))
+                            warnings.warn("Backing off for {} seconds".format(t), category=OpenAIAPIWarning)
                             await asyncio.sleep(t)
             except asyncio.CancelledError as e:
                 break
@@ -723,15 +721,22 @@ class AsyncOpenAIAPI:
     async def complete(self, request_id=None, **kwargs):
         assert "prompt" in kwargs, f"bopenai requires prompt to be set"
 
+        # check for workers
+        if len(self.complete_request_workers) == 0:
+            raise APIShutDownException(f"bopenai requires at least one worker to be running to issue new complete requests.")
+
         loop = asyncio.get_running_loop()
+
         result_fut = loop.create_future()
         self.futures.add(result_fut)
+
+        assert loop in self.worker_loops, f"bopenai requires the current event loop to be running in one of the worker threads"
 
         if request_id is None:
             request_id = self.request_ctr
             self.request_ctr += 1
         else:
-            print("re-trying request id", request_id)
+            warnings.warn("OpenAI request with ID {} failed (timeout or other error) and will be retried".format(request_id), category=OpenAIAPIWarning)
         
         kwargs = {"future": result_fut, "request_id": request_id, **kwargs}
         

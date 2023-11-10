@@ -7,12 +7,12 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 from lmql.ops.ops import *
+from lmql.runtime.context import Context
 from lmql.runtime.langchain import chain, call_sync
 from lmql.runtime.output_writer import silent
-from lmql.runtime.interpreter import PromptInterpreter
-from lmql.runtime.postprocessing.conditional_prob import \
-    ConditionalDistributionPostprocessor
 from lmql.runtime.postprocessing.group_by import GroupByPostprocessor
+from lmql.api.inspect import is_query
+from lmql.runtime.formatting import format, tag
 
 class LMQLInputVariableScope:
     def __init__(self, f, calling_frame):
@@ -129,8 +129,10 @@ class LMQLQueryFunction:
         
         signature = self.function_context.argnames
         args_of_query = self.function_context.args_of_query
-        scope = self.function_context.scope
+        if "__self__" in kwargs: kwargs["self"] = kwargs.pop("__self__")
         
+        scope = self.function_context.scope
+
         runtime_args = {k:v for k,v in kwargs.items() if not k in signature.parameters.keys() and k not in args_of_query}
         query_kwargs = {k:v for k,v in kwargs.items() if k in signature.parameters.keys()}
 
@@ -154,11 +156,12 @@ class LMQLQueryFunction:
                     raise e
             else:    
                 if len(e.args) == 1 and e.args[0].startswith("missing "):
-                    e.args = (f"Call to @lmql.query function is " + e.args[0] + "." + f" Expecting {signature}, but got positional args {args} and {kwargs}.",)
+                    e.args = (f"Call to @lmql.query function is " + e.args[0] + "." + f" Expecting {signature}, but got positional arguments {args} and keyword arguments {kwargs}.",)
                 elif len(e.args) == 1:
                     e.args = (e.args[0] + "." + f" Expecting {signature}, but got positional args {args} and {kwargs}.",)
                 raise e
         
+        # apply default arguments
         signature.apply_defaults()
 
         # special case, if signature is empty (no input variables provided)
@@ -203,10 +206,12 @@ class LMQLQueryFunction:
         return self.__acall__(*args, **kwargs)
 
     async def __acall__(self, *args, **kwargs):
+        from lmql.runtime.interpreter import PromptInterpreter
+
         query_kwargs, runtime_args = self.make_kwargs(*args, **kwargs)
-        
+
         forced_model = self.model or runtime_args.get("model") or (self.extra_args or {}).get("model")
-        interpreter = PromptInterpreter(force_model=forced_model)
+        interpreter = PromptInterpreter(force_model=forced_model, name=self.name)
 
         if self.output_writer is not None:
             runtime_args["output_writer"] = self.output_writer
@@ -226,20 +231,12 @@ class LMQLQueryFunction:
         finally:
             if PromptInterpreter.main == interpreter:
                 PromptInterpreter.main = None
-
-        # applies distribution postprocessor if required
-        results = await (ConditionalDistributionPostprocessor(interpreter).process(results))
-
-        # apply remaining postprocessors
-        if self.postprocessors is not None:
-            for postprocessor in self.postprocessors:
-                results = await postprocessor.process(results, self.output_writer)
         
         interpreter.print_stats()
         interpreter.dcmodel.close()
 
         # for lmql.F we assume 'argmax' and unpack the result
-        if "is_f_function" in interpreter.extra_kwargs:
+        if "is_f_function" in interpreter.extra_kwargs and type(results) is list and len(results) == 1:
             results = results[0]
 
         return results
@@ -259,12 +256,6 @@ def context_call(fct_name, *args, **kwargs):
 
 def interrupt_call(fct_name, *args, **kwargs):
     return ("interrupt:" + fct_name, args, kwargs)
-
-def f_escape(s):
-    return str(s).replace("[", "[[").replace("]", "]]")
-
-def tag(t):
-    return f"<lmql:{t}/>"
 
 def compiled_query(output_variables=None, group_by=None):
     if output_variables is None:
@@ -290,11 +281,22 @@ def compiled_query(output_variables=None, group_by=None):
 async def call(fct, *args, **kwargs):
     if type(fct) is LMQLQueryFunction or (hasattr(fct, "__lmql_query_function__") and fct.__lmql_query_function__.is_async):
         result = await fct(*args, **kwargs)
-        if len(result) == 1: 
-            return result[0]
-        else: 
-            return result
+        return result
     if inspect.iscoroutinefunction(fct):
         return await fct(*args, **kwargs)
     else:
         return fct(*args, **kwargs)
+
+def type_expr(var_name, target, lcls, glbs, *args, **kwargs):
+    """
+    Transforms expressions in query strings like "Hello [WHO: <expr>]" into
+    their constraint equivalent.
+    """
+    if is_query(target):
+        return InlineCallOp([target, list((Var(var_name),) + args)], lcls, glbs)
+    elif type(target) is str:
+        return RegexOp([Var(var_name), target])
+    elif target is int:
+        return IntOp([Var(var_name)])
+    else:
+        raise TypeError("Not a valid type expression or tactic annotation '" + str(target) + "' for variable '" + var_name + "'.")
